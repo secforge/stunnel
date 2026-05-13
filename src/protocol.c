@@ -82,6 +82,8 @@ NOEXPORT void imap_server_middle(CLI *);
 NOEXPORT void nntp_client_middle(CLI *);
 
 NOEXPORT void ldap_client_middle(CLI *);
+NOEXPORT const char *ldap_server_init(SERVICE_OPTIONS *);
+NOEXPORT void ldap_server_middle(CLI *);
 
 NOEXPORT void connect_server_early(CLI *);
 NOEXPORT const char *connect_client_init(SERVICE_OPTIONS *);
@@ -148,7 +150,8 @@ const char *protocol_init(SERVICE_OPTIONS *opt) {
         {.name="nntp", .sock_type=SOCK_STREAM,
             .client={.middle=nntp_client_middle}},
         {.name="ldap", .sock_type=SOCK_STREAM,
-            .client={.middle=ldap_client_middle}},
+            .client={.middle=ldap_client_middle},
+            .server={.init=ldap_server_init, .middle=ldap_server_middle}},
         {.name="connect", .sock_type=SOCK_STREAM,
             .client={.init=connect_client_init, .middle=connect_client_middle},
             .server={.early=connect_server_early}},
@@ -1364,6 +1367,100 @@ NOEXPORT void ldap_client_middle(CLI *c) {
     /* any remaining data is ignored */
 
     s_log(LOG_INFO, "LDAP Start TLS successfully negotiated");
+}
+
+#define LDAP_REQUEST_OP_APPLICATION_23          0x77
+#define LDAP_RESPONSE_MATCHED_DN_TAG            0x04
+#define LDAP_RESPONSE_NAME_CONTEXT_10           0x8a
+#define LDAP_STARTTLS_OID_LEN                   0x16
+#define LDAP_STARTTLS_RESPONSE_MSGID_OFFSET     4
+
+/* STARTTLS ExtendedResponse (success), messageID patched at offset 4 */
+static uint8_t ldap_starttls_response[38]={
+    0x30,                           /* UNIVERSAL SEQUENCE */
+    0x24,                           /* len = 36 */
+    0x02,                           /* INTEGER (messageID) */
+    0x01,                           /* len = 1 */
+    0x01,                           /* val = 1 (patched at runtime) */
+    0x78,                           /* APPLICATION 24 (ExtendedResponse) */
+    0x1f,                           /* len = 31 */
+    0x0a,                           /* ENUMERATED (resultCode) */
+    0x01,                           /* len = 1 */
+    0x00,                           /* val = 0 (success) */
+    0x04,                           /* OCTET STRING (matchedDN) */
+    0x00,                           /* len = 0 */
+    0x04,                           /* OCTET STRING (diagnosticMessage) */
+    0x00,                           /* len = 0 */
+    0x8a,                           /* CONTEXT [10] (responseName) */
+    0x16,                           /* len = 22 */
+    '1', '.', '3', '.', '6', '.', '1', '.', '4', '.', '1', '.',
+    '1', '4', '6', '6', '.', '2', '0', '0', '3', '7'
+};
+
+NOEXPORT const char *ldap_server_init(SERVICE_OPTIONS *opt) {
+    opt->option.connect_before_ssl=1; /* c->remote_fd needed */
+    return NULL;
+}
+
+NOEXPORT void ldap_server_middle(CLI *c) {
+    uint8_t buffer_8;
+    uint32_t buffer_32;
+    size_t req_len;
+    uint8_t ldap_request[128];
+    size_t req_idx;
+    uint8_t msg_id;
+    uint8_t response[sizeof(ldap_starttls_response)];
+
+    s_log(LOG_DEBUG, "Receiving LDAP Start TLS request tag");
+    s_read(c, c->local_rfd.fd, &buffer_8, 1);
+    if(buffer_8!=LDAP_UNIVERSAL_SEQUENCE) {
+        s_log(LOG_ERR, "LDAP request is not UNIVERSAL SEQUENCE");
+        throw_exception(c, 1);
+    }
+
+    s_log(LOG_DEBUG, "Receiving LDAP Start TLS request length");
+    s_read(c, c->local_rfd.fd, &buffer_8, 1);
+    if(buffer_8==LDAP_WINLDAP_FOUR_BYTE_LEN_FLAG) { /* WinLDAP */
+        s_read(c, c->local_rfd.fd, &buffer_32, 4);
+        req_len=ntohl(buffer_32);
+    } else {
+        req_len=buffer_8;
+    }
+    if(req_len>sizeof(ldap_request)) {
+        s_log(LOG_ERR, "LDAP request too long (%lu byte(s))",
+            (unsigned long)req_len);
+        throw_exception(c, 1);
+    }
+
+    s_log(LOG_DEBUG, "Receiving LDAP Start TLS request value (%lu byte(s))",
+        (unsigned long)req_len);
+    memset(ldap_request, 0, sizeof(ldap_request));
+    s_read(c, c->local_rfd.fd, ldap_request, req_len);
+
+    s_log(LOG_DEBUG, "Decoding LDAP Start TLS request");
+    req_idx=0;
+    if(ldap_request[req_idx++]!=LDAP_RESPONSE_MSG_ID_TAG_INTEGER) {
+        s_log(LOG_ERR, "LDAP request has an incorrect message ID type");
+        throw_exception(c, 1);
+    }
+    if(ldap_request[req_idx]<1 || ldap_request[req_idx]>4) {
+        s_log(LOG_ERR, "LDAP request has an unsupported message ID length (%u)",
+            ldap_request[req_idx]);
+        throw_exception(c, 1);
+    }
+    req_idx+=(size_t)ldap_request[req_idx]+1; /* skip length + value */
+    msg_id=ldap_request[req_idx-1]; /* last byte of messageID */
+    if(ldap_request[req_idx++]!=LDAP_REQUEST_OP_APPLICATION_23) {
+        s_log(LOG_ERR, "LDAP request protocol op is not ExtendedRequest");
+        throw_exception(c, 1);
+    }
+
+    s_log(LOG_DEBUG, "Sending LDAP Start TLS response (messageID=%u)", msg_id);
+    memcpy(response, ldap_starttls_response, sizeof(response));
+    response[LDAP_STARTTLS_RESPONSE_MSGID_OFFSET]=msg_id;
+    s_write(c, c->local_wfd.fd, response, sizeof(response));
+
+    s_log(LOG_INFO, "LDAP Start TLS accepted from client");
 }
 
 /**************************************** connect */
